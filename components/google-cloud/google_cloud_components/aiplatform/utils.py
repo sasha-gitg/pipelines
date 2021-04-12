@@ -481,3 +481,196 @@ def convert_method_to_component(
     # TODO: Possibly rename method
 
     return component_yaml_generator
+
+
+def convert_method_to_component_yaml(
+    method: Callable, should_serialize_init: bool = False
+) -> Callable:
+    """Converts a MB SDK Method to a Component wrapper.
+
+    The wrapper enforces the correct signature w.r.t the MB SDK. The signature
+    is also available to inspect.
+
+    For example:
+
+    aiplatform.Model.deploy is converted to ModelDeployOp
+
+    Which can be called:
+        model_deploy_step = ModelDeployOp(
+            project=project,  # Pipeline paramter
+            endpoint=endpoint_create_step.outputs['endpoint'],
+            model=model_upload_step.outputs['model'],
+            deployed_model_display_name='my-deployed-model',
+            machine_type='n1-standard-4',
+        )
+
+    Generates and invokes the following Component:
+
+    name: Model-deploy
+    inputs:
+    - {name: project, type: String}
+    - {name: endpoint, type: Artifact}
+    - {name: model, type: Model}
+    outputs:
+    - {name: endpoint, type: Artifact}
+    implementation:
+      container:
+        image: gcr.io/sashaproject-1/mb_sdk_component:latest
+        command:
+        - python3
+        - remote_runner.py
+        - --cls_name=Model
+        - --method_name=deploy
+        - --method.deployed_model_display_name=my-deployed-model
+        - --method.machine_type=n1-standard-4
+        args:
+        - --resource_name_output_uri
+        - {outputUri: endpoint}
+        - --init.project
+        - {inputValue: project}
+        - --method.endpoint
+        - {inputUri: endpoint}
+        - --init.model_name
+        - {inputUri: model}
+
+
+    Args:
+        method (Callable): A MB SDK Method
+        should_serialize_init (bool): Whether to also include the constructor params
+            in the compoennt
+    Retruns:
+        A Component wrapper that accepts the MB SDK params and returns a Task.
+    """
+    method_name = method.__name__
+    method_signature = inspect.signature(method)
+
+    # get class name and constructor signature
+    if inspect.ismethod(method):
+        cls = method.__self__
+        cls_name = cls.__name__
+        init_signature = inspect.signature(method.__self__.__init__)
+    else:
+        cls = getattr(
+            inspect.getmodule(method),
+            method.__qualname__.split('.<locals>', 1)[0].rsplit('.', 1)[0]
+        )
+        cls_name = cls.__name__
+        init_signature = inspect.signature(cls.__init__)
+
+    # map to store parameter names that are changed in components
+    # this is generally used for constructor where the mb sdk takes
+    # a resource name but the component takes a metadata entry
+    # ie: model: system.Model -> model_name: str
+    component_param_name_to_mb_sdk_param_name = {}
+    # remove unused parameters
+    method_signature = filter_signature(method_signature)
+    init_signature = filter_signature(
+        init_signature,
+        is_init_signature=True,
+        self_type=cls,
+        component_param_name_to_mb_sdk_param_name=
+        component_param_name_to_mb_sdk_param_name
+    )
+
+    # use this to partition args to method or constructor
+    init_arg_names = set(init_signature.parameters.keys()
+                        ) if should_serialize_init else set([])
+
+    # determines outputs for this component
+    output_type = resolve_annotation(method_signature.return_annotation)
+    outputs = ''
+    output_args = ''
+    if output_type:
+        output_metadata_name, output_metadata_type = map_resource_to_metadata_type(
+            output_type
+        )
+        outputs = '\n'.join([
+            'outputs:',
+            f'- {{name: {output_metadata_name}, type: {output_metadata_type}}}'
+        ])
+        output_args = '\n'.join([
+            '    - --resource_name_output_uri',
+            f'    - {{outputUri: {output_metadata_name}}}',
+        ])
+
+    def make_args(args_to_serialize: Dict[str, Dict[str, Any]]) -> str:
+        """Takes the args dicitionary and return serailized Component string
+        for args.
+
+        Args:
+            args_to_serialize: Dictionary of format
+                {'init': {'param_name_1': param_1}, {'method'}: {'param_name_2': param_name_2}}
+        Returns:
+            Serialized args compatible with Component YAML
+        """
+        additional_args = []
+        for key, args in args_to_serialize.items():
+            for arg_key, value in args.items():
+                additional_args.append(f"    - --{key}.{arg_key}={value}")
+        return '\n'.join(additional_args)
+
+
+    def make_param_optional(component_param_name, prefix_key, component_type):
+        return "\n".join([
+"    - if:",
+f"        cond: {{isPresent: {component_param_name}}}",
+"        then:",
+f"        - --{prefix_key}.{component_param_name}",
+f"        - {{{component_type}: {component_param_name}}}"
+        ])
+
+
+    inputs = ["inputs:"]
+    input_args = []
+    prefix_key = METHOD_KEY
+    for param_name, param in method_signature.parameters.items():
+        param_type = param.annotation
+        param_type = resolve_annotation(param_type)
+        serializer = get_serializer(param_type)
+        if serializer:
+            param_type = str
+
+        component_param_name = component_param_name_to_mb_sdk_param_name.get(
+            param_name, param_name
+        )
+
+        if is_mb_sdk_resource_noun_type(param_type):
+            metadata_type = map_resource_to_metadata_type(param_type)[1]
+            component_param_type, component_type = metadata_type, 'inputUri'
+        else:
+            component_param_type, component_type = 'String', 'inputValue'
+
+        is_optional = False if param.default is inspect._empty else True
+
+        inputs.append(
+            f"- {{name: {param_name}, type: {component_param_type}, optional: {str(is_optional).lower()}}}"
+        )
+
+        if is_optional:
+            input_args.append(make_param_optional(component_param_name, prefix_key, component_type))
+        else:
+            input_args.append(
+                '\n'.join([
+                    f'    - --{prefix_key}.{component_param_name}',
+                    f'    - {{{component_type}: {component_param_name}}}'
+                ])
+            )
+
+    inputs = "\n".join(inputs) if len(inputs) > 1 else ''
+    input_args = "\n".join(input_args) if input_args else ''
+    component_text = "\n".join([
+        f'name: {cls_name}-{method_name}', f'{inputs}', outputs,
+        'implementation:', '  container:',
+        '    image: gcr.io/sashaproject-1/aiplatform_component:latest',
+        '    command:', '    - python3', '    - -m',
+        '    - google_cloud_components.aiplatform.remote_runner',
+        f'    - --cls_name={cls_name}',
+        f'    - --method_name={method_name}',
+        '    args:', output_args,
+        f'{input_args}'
+    ])
+
+    print(component_text)
+
+
+    return component_text
